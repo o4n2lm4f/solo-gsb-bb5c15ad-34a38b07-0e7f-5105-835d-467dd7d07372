@@ -34,6 +34,16 @@ def _iso(ts: float | None) -> str | None:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+def _sub_out(sub: dict) -> dict:
+    """Serialize a subscription row for the API, deriving the paused flag."""
+    return {
+        **sub,
+        "created_at": _iso(sub["created_at"]),
+        "paused": sub["paused_at"] is not None,
+        "paused_at": _iso(sub["paused_at"]),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db = Database(config.DB_PATH)
@@ -75,12 +85,12 @@ def healthz() -> dict:
 @app.post("/subscriptions", response_model=SubscriptionOut, status_code=201)
 def create_subscription(body: SubscriptionCreate, response: Response) -> dict:
     sub = app.state.db.create_subscription(body.target_url, body.secret)
-    return {**sub, "created_at": _iso(sub["created_at"])}
+    return _sub_out(sub)
 
 
 @app.get("/subscriptions", response_model=list[SubscriptionOut])
 def list_subscriptions() -> list[dict]:
-    return [{**s, "created_at": _iso(s["created_at"])} for s in app.state.db.list_subscriptions()]
+    return [_sub_out(s) for s in app.state.db.list_subscriptions()]
 
 
 @app.get("/subscriptions/{sub_id}", response_model=SubscriptionOut)
@@ -88,7 +98,7 @@ def get_subscription(sub_id: str) -> dict:
     sub = app.state.db.get_subscription(sub_id)
     if sub is None:
         raise HTTPException(404, f"subscription {sub_id!r} not found")
-    return {**sub, "created_at": _iso(sub["created_at"])}
+    return _sub_out(sub)
 
 
 @app.delete("/subscriptions/{sub_id}", status_code=204)
@@ -96,6 +106,32 @@ def delete_subscription(sub_id: str) -> Response:
     if not app.state.db.delete_subscription(sub_id):
         raise HTTPException(404, f"subscription {sub_id!r} not found")
     return Response(status_code=204)
+
+
+@app.post("/subscriptions/{sub_id}/pause", response_model=SubscriptionOut)
+def pause_subscription(sub_id: str) -> dict:
+    """Pause claiming of new deliveries for a subscription (idempotent).
+
+    Tasks already in progress run to completion; tasks submitted while
+    paused are stored and stay 'pending' until the subscription resumes.
+    """
+    sub = app.state.db.set_subscription_paused(sub_id, True)
+    if sub is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return _sub_out(sub)
+
+
+@app.post("/subscriptions/{sub_id}/resume", response_model=SubscriptionOut)
+def resume_subscription(sub_id: str) -> dict:
+    """Resume a paused subscription (idempotent).
+
+    Pending tasks keep their original next_attempt_at and are claimed in
+    the usual per-subscription task_id order; nothing is rescheduled.
+    """
+    sub = app.state.db.set_subscription_paused(sub_id, False)
+    if sub is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return _sub_out(sub)
 
 
 # ----------------------------------------------------------------------

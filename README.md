@@ -5,6 +5,7 @@
 ## 功能特性
 
 - **订阅管理**：创建/查询/删除订阅（目标 URL + secret）
+- **订阅暂停/恢复**：`POST /subscriptions/{id}/pause` 暂停后不再领取该订阅的新任务（已 `in_progress` 的尝试正常完成），暂停期间提交的事件照常入库并保持 `pending`；`/resume` 恢复后按原 `next_attempt_at` 与 `task_id` 顺序继续投递，不批量改写调度时间；暂停状态持久化在 SQLite 中，重启后保持
 - **HMAC 受保护入站接口**：`POST /ingest` 使用 `INGEST_SECRET` 校验 `X-Webhook-Signature`（覆盖时间戳、ID 与原始 JSON），并强制 ±300 秒时间窗
 - **入站幂等与防重放**：已接收的 `X-Webhook-Id` 持久化在 SQLite 中；重复 ID + 相同内容返回首次接收结果且不重复投递，相同 ID 不同内容返回 `409`
 - **事件投递**：一次提交可指定多个订阅，每个订阅生成独立任务
@@ -52,7 +53,7 @@ curl -s -X POST http://localhost:8000/subscriptions \
 ```
 
 ```json
-{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00"}
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": false, "paused_at": null}
 ```
 
 ### 2. 提交入站事件（HMAC 保护，POST /ingest）
@@ -173,14 +174,39 @@ curl -s http://localhost:8000/events/evt-001
 
 注意：若同一订阅存在更早的未完成任务，后续任务会因有序调度而保持 `pending`（被前序任务阻塞），状态查询会如实展示这些被阻塞的任务。
 
+### 5. 暂停与恢复订阅投递
+
+```bash
+curl -s -X POST http://localhost:8000/subscriptions/44a79d7077ce/pause
+```
+
+```json
+{"id": "44a79d7077ce", "target_url": "http://localhost:9001/hook", "created_at": "2026-09-17T11:11:24+00:00", "paused": true, "paused_at": "2026-09-18T08:30:00+00:00"}
+```
+
+```bash
+curl -s -X POST http://localhost:8000/subscriptions/44a79d7077ce/resume
+```
+
+行为约定：
+
+- **暂停生效边界**：暂停在任务认领时生效——已提交暂停后，工作器不再领取该订阅的任何新任务；暂停前已被认领（`in_progress`）的投递会正常执行完成，暂停不会中断进行中的 HTTP 请求。
+- **暂停期间继续入库**：通过 `POST /events` 或 `POST /ingest` 提交的事件照常持久化，任务保持 `pending`（含因退避等待重试的任务，其 `next_attempt_at` 不变），可在 `GET /events/{id}` 中查询到。
+- **恢复语义**：恢复只清除订阅上的暂停标记，**不批量改写**任何任务的 `next_attempt_at`；工作器按原到期时间、并在同一订阅内按 `task_id` 严格顺序继续领取——到期时间已过的任务立即被领取，未到期的仍在原时间执行。
+- **幂等**：重复暂停/恢复是幂等操作，均返回 `200` 与当前订阅状态（重复暂停保留首次的 `paused_at`）；订阅不存在时返回 `404`。
+- **状态可见**：`GET /subscriptions` 与 `GET /subscriptions/{id}` 返回 `paused`（布尔）与 `paused_at`（ISO 时间或 `null`）。
+- **持久化**：暂停状态存储在 SQLite 的 `subscriptions.paused_at` 列中，服务（或容器）重启后保持。
+
 ### 其他端点
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | `POST` | `/ingest` | HMAC 保护的入站事件接口（时间窗 + 签名 + ID 幂等） |
 | `POST` | `/events` | 内部提交事件（event_id + payload，无需签名） |
-| `GET` | `/subscriptions` | 列出全部订阅 |
-| `GET` | `/subscriptions/{id}` | 查询单个订阅 |
+| `GET` | `/subscriptions` | 列出全部订阅（含 `paused` / `paused_at`） |
+| `GET` | `/subscriptions/{id}` | 查询单个订阅（含 `paused` / `paused_at`） |
+| `POST` | `/subscriptions/{id}/pause` | 暂停订阅投递（幂等，不存在返回 404） |
+| `POST` | `/subscriptions/{id}/resume` | 恢复订阅投递（幂等，不存在返回 404） |
 | `DELETE` | `/subscriptions/{id}` | 删除订阅（已有任务保留历史） |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -222,6 +248,7 @@ def is_valid(secret: str, body: bytes, signature_header: str) -> bool:
 - **入站幂等**：每个验签通过的 `X-Webhook-Id` 在 `ingested_events` 表中记录一行（原始 body 字节 + 首次回执）。查重、冲突判定、建事件、建任务在同一个 SQLite 事务中完成；重放请求直接返回存储的首次回执，即使并发到达也只会有一个请求建任务。
 - **原子认领**：工作器在单个连接锁保护的临界区内完成「选中最旧到期任务 → 置为 `in_progress`」，并发工作器不会领到同一任务。
 - **按订阅有序**：认领查询附带 `NOT EXISTS` 条件——同订阅存在 id 更小且状态为 `pending`/`in_progress` 的任务时，当前任务不可认领；只有前序任务进入终态（`delivered`/`failed`）才放行下一条。条件针对持久化状态在认领时求值，故重试退避、崩溃恢复（`in_progress` 重置为 `pending` 后依然阻塞后续任务）与多工作器并发下均成立；不同订阅互不影响，可并行投递。
+- **订阅暂停**：暂停只是翻转 `subscriptions.paused_at` 标记（首次暂停的时间戳，重复暂停不变），从不修改任务行。认领查询增加 `s.paused_at IS NULL` 条件，与有序约束在同一原子临界区内求值，因此暂停对已 `in_progress` 的尝试（至多 `WORKER_COUNT` 个并发）无影响、它们照常完成，而新的认领立即停摆；恢复时清除标记即可，所有 `pending` 任务保留原 `next_attempt_at` 与 `task_id` 顺序，无需任何批量更新。
 - **崩溃恢复**：启动时将残留的 `in_progress` 任务重置为 `pending` 并立即到期；`pending` 任务按原 `next_attempt_at` 继续调度。
 - **退避策略**：第 n 次失败后延迟 `2^(n-1)` 秒（1、2、4），第 4 次失败后任务终止，结果为 `failed`。
 - **成功判定**：仅 HTTP 2xx 视为成功；其余状态码、连接错误、超时均触发重试。
