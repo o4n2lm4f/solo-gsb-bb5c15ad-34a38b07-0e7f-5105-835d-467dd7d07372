@@ -34,6 +34,15 @@ def _iso(ts: float | None) -> str | None:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
+def _sub_out(sub: dict) -> dict:
+    return {
+        **sub,
+        "created_at": _iso(sub["created_at"]),
+        "paused": bool(sub.get("paused", 0)),
+        "paused_at": _iso(sub.get("paused_at")),
+    }
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db = Database(config.DB_PATH)
@@ -75,12 +84,12 @@ def healthz() -> dict:
 @app.post("/subscriptions", response_model=SubscriptionOut, status_code=201)
 def create_subscription(body: SubscriptionCreate, response: Response) -> dict:
     sub = app.state.db.create_subscription(body.target_url, body.secret)
-    return {**sub, "created_at": _iso(sub["created_at"])}
+    return _sub_out(sub)
 
 
 @app.get("/subscriptions", response_model=list[SubscriptionOut])
 def list_subscriptions() -> list[dict]:
-    return [{**s, "created_at": _iso(s["created_at"])} for s in app.state.db.list_subscriptions()]
+    return [_sub_out(s) for s in app.state.db.list_subscriptions()]
 
 
 @app.get("/subscriptions/{sub_id}", response_model=SubscriptionOut)
@@ -88,7 +97,27 @@ def get_subscription(sub_id: str) -> dict:
     sub = app.state.db.get_subscription(sub_id)
     if sub is None:
         raise HTTPException(404, f"subscription {sub_id!r} not found")
-    return {**sub, "created_at": _iso(sub["created_at"])}
+    return _sub_out(sub)
+
+
+@app.post("/subscriptions/{sub_id}/pause", response_model=SubscriptionOut)
+def pause_subscription(sub_id: str) -> dict:
+    # Idempotent: pausing an already-paused subscription is a no-op.
+    sub = app.state.db.set_paused(sub_id, paused=True)
+    if sub is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return _sub_out(sub)
+
+
+@app.post("/subscriptions/{sub_id}/resume", response_model=SubscriptionOut)
+def resume_subscription(sub_id: str) -> dict:
+    # Idempotent: resuming an active subscription is a no-op. No task
+    # timestamps are rewritten; workers resume strictly at the original
+    # next_attempt_at and in task_id order.
+    sub = app.state.db.set_paused(sub_id, paused=False)
+    if sub is None:
+        raise HTTPException(404, f"subscription {sub_id!r} not found")
+    return _sub_out(sub)
 
 
 @app.delete("/subscriptions/{sub_id}", status_code=204)

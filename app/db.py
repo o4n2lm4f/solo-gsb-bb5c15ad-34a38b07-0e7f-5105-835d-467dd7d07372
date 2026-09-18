@@ -17,7 +17,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     id          TEXT PRIMARY KEY,
     target_url  TEXT NOT NULL,
     secret      TEXT NOT NULL,
-    created_at  REAL NOT NULL
+    created_at  REAL NOT NULL,
+    paused      INTEGER NOT NULL DEFAULT 0,   -- 1 = paused: pending tasks are not claimed
+    paused_at   REAL                           -- epoch seconds when the current pause started
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -76,7 +78,18 @@ class Database:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first release to older databases."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(subscriptions)")}
+        if "paused" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subscriptions ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"
+            )
+        if "paused_at" not in cols:
+            self._conn.execute("ALTER TABLE subscriptions ADD COLUMN paused_at REAL")
 
     def close(self) -> None:
         with self._lock:
@@ -99,14 +112,17 @@ class Database:
     def list_subscriptions(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, target_url, created_at FROM subscriptions ORDER BY created_at"
+                "SELECT id, target_url, created_at, paused, paused_at "
+                "FROM subscriptions ORDER BY created_at"
             ).fetchall()
         return [dict(r) for r in rows]
 
     def get_subscription(self, sub_id: str) -> dict | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, target_url, created_at FROM subscriptions WHERE id = ?", (sub_id,)
+                "SELECT id, target_url, created_at, paused, paused_at "
+                "FROM subscriptions WHERE id = ?",
+                (sub_id,),
             ).fetchone()
         return dict(row) if row else None
 
@@ -122,6 +138,44 @@ class Database:
             cur = self._conn.execute("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
             self._conn.commit()
         return cur.rowcount > 0
+
+    def set_paused(self, sub_id: str, paused: bool) -> dict | None:
+        """Pause or resume a subscription idempotently.
+
+        Pausing only flips the flag (and stamps paused_at on the transition);
+        task rows and their next_attempt_at values are never touched. Workers
+        stop *claiming* pending tasks of a paused subscription, while a task
+        already in_progress keeps running to completion. Resuming clears the
+        flag, so tasks become claimable again strictly at their original
+        due times (overdue tasks immediately, future tasks when due), in the
+        existing task_id order.
+
+        Repeating the same state is a no-op that returns the current row.
+        Returns None when the subscription does not exist.
+        """
+        now = time.time()
+        with self._lock:
+            if paused:
+                # Stamp paused_at only while actually transitioning to paused,
+                # so repeated pauses stay idempotent (paused_at is preserved).
+                self._conn.execute(
+                    "UPDATE subscriptions SET paused = 1, paused_at = ? "
+                    "WHERE id = ? AND paused = 0",
+                    (now, sub_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE subscriptions SET paused = 0, paused_at = NULL "
+                    "WHERE id = ? AND paused = 1",
+                    (sub_id,),
+                )
+            row = self._conn.execute(
+                "SELECT id, target_url, created_at, paused, paused_at "
+                "FROM subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+            self._conn.commit()
+        return dict(row) if row else None
 
     # ------------------------------------------------------------------
     # events and tasks
@@ -257,6 +311,11 @@ class Database:
         Different subscriptions are independent and still claimed in
         parallel; a blocked task simply stays 'pending' and remains
         visible as such in status queries.
+
+        A paused subscription contributes no claimable tasks: its pending
+        tasks stay pending (their next_attempt_at is untouched), while a
+        task already claimed ('in_progress') is unaffected and completes
+        normally.
         """
         with self._lock:
             row = self._conn.execute(
@@ -265,6 +324,7 @@ class Database:
                    LEFT JOIN subscriptions s ON s.id = t.subscription_id
                    LEFT JOIN events e ON e.id = t.event_id
                    WHERE t.status = 'pending' AND t.next_attempt_at <= ?
+                     AND COALESCE(s.paused, 0) = 0
                      AND NOT EXISTS (
                            SELECT 1 FROM tasks earlier
                            WHERE earlier.subscription_id = t.subscription_id

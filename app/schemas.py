@@ -23,6 +23,8 @@ class SubscriptionOut(BaseModel):
     id: str
     target_url: str
     created_at: str
+    paused: bool = False
+    paused_at: str | None = None
 
 
 class EventCreate(BaseModel):
